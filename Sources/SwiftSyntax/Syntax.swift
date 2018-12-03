@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -103,11 +103,6 @@ extension Syntax {
   /// Whether or not this node represents a Pattern.
   public var isPattern: Bool {
     return raw.kind.isPattern
-  }
-
-  /// Whether or not this node represents an unknown node.
-  public var isUnknown: Bool {
-    return raw.kind.isUnknown
   }
 
   /// The parent of this syntax node, or `nil` if this node is the root.
@@ -244,9 +239,9 @@ extension Syntax {
     in file: URL,
     afterLeadingTrivia: Bool = true
   ) -> SourceLocation {
-    let pos = afterLeadingTrivia ?
-      data.positionAfterSkippingLeadingTrivia :
-      data.position
+    let pos = afterLeadingTrivia ? 
+      data.position :
+      data.positionAfterSkippingLeadingTrivia
     return SourceLocation(file: file.path, position: pos)
   }
 

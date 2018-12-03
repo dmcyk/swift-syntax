@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -22,18 +22,6 @@ extension CodingUserInfoKey {
   /// Value must have signature `(SyntaxNodeId) -> RawSyntax`
   static let omittedNodeLookupFunction =
     CodingUserInfoKey(rawValue: "SwiftSyntax.RawSyntax.OmittedNodeLookup")!
-}
-
-extension ByteTreeUserInfoKey {
-  /// Callback that will be called whenever a `RawSyntax` node is decoded
-  /// Value must have signature `(RawSyntax) -> Void`
-  static let rawSyntaxDecodedCallback =
-    ByteTreeUserInfoKey(rawValue: "SwiftSyntax.RawSyntax.DecodedCallback")
-  /// Function that shall be used to look up nodes that were omitted in the
-  /// syntax tree transfer.
-  /// Value must have signature `(SyntaxNodeId) -> RawSyntax`
-  static let omittedNodeLookupFunction =
-    ByteTreeUserInfoKey(rawValue: "SwiftSyntax.RawSyntax.OmittedNodeLookup")
 }
 
 /// Box a value type into a reference type
@@ -85,7 +73,7 @@ fileprivate enum RawSyntaxData {
 /// Represents the raw tree structure underlying the syntax tree. These nodes
 /// have no notion of identity and only provide structure to the tree. They
 /// are immutable and can be freely shared between syntax nodes.
-final class RawSyntax {
+struct RawSyntax: Codable {
   fileprivate let data: RawSyntaxData
   let presence: SourcePresence
 
@@ -198,6 +186,61 @@ final class RawSyntax {
     case nodeLookupFailed(SyntaxNodeId)
   }
 
+  /// Creates a RawSyntax from the provided Foundation Decoder.
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let id = try container.decodeIfPresent(SyntaxNodeId.self, forKey: .id)
+    let omitted = try container.decodeIfPresent(Bool.self, forKey: .omitted) ?? false
+
+    if omitted {
+      guard let id = id else {
+        throw IncrementalDecodingError.omittedNodeHasNoId
+      }
+      guard let lookupFunc = decoder.userInfo[.omittedNodeLookupFunction] as?
+                               (SyntaxNodeId) -> RawSyntax? else {
+        throw IncrementalDecodingError.noLookupFunctionPassed
+      }
+      guard let lookupNode = lookupFunc(id) else {
+        throw IncrementalDecodingError.nodeLookupFailed(id)
+      }
+      self = lookupNode
+      return
+    }
+
+    let presence = try container.decode(SourcePresence.self, forKey: .presence)
+    if let kind = try container.decodeIfPresent(SyntaxKind.self, forKey: .kind) {
+      let layout = try container.decode([RawSyntax?].self, forKey: .layout)
+      self.init(kind: kind, layout: layout, presence: presence, id: id)
+    } else {
+      let kind = try container.decode(TokenKind.self, forKey: .tokenKind)
+      let leadingTrivia = try container.decode(Trivia.self, forKey: .leadingTrivia)
+      let trailingTrivia = try container.decode(Trivia.self, forKey: .trailingTrivia)
+      self.init(kind: kind, leadingTrivia: leadingTrivia,
+                trailingTrivia: trailingTrivia, presence: presence, id: id)
+    }
+    if let callback = decoder.userInfo[.rawSyntaxDecodedCallback] as?
+                        (RawSyntax) -> Void {
+      callback(self)
+    }
+  }
+
+  /// Encodes the RawSyntax to the provided Foundation Encoder.
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    switch self.data {
+    case let .node(kind, layout):
+      try container.encode(id, forKey: .id)
+      try container.encode(kind, forKey: .kind)
+      try container.encode(layout, forKey: .layout)
+    case let .token(kind, leadingTrivia, trailingTrivia):
+      try container.encode(id, forKey: .id)
+      try container.encode(kind, forKey: .tokenKind)
+      try container.encode(leadingTrivia, forKey: .leadingTrivia)
+      try container.encode(trailingTrivia, forKey: .trailingTrivia)
+    }
+    try container.encode(presence, forKey: .presence)
+  }
+
   /// Creates a RawSyntax node that's marked missing in the source with the
   /// provided kind and layout.
   /// - Parameters:
@@ -262,6 +305,40 @@ final class RawSyntax {
     newLayout[index] = newChild
     return replacingLayout(newLayout)
   }
+}
+
+extension RawSyntax {
+    func accept(_ visitor: RawSyntaxVisitor) {
+        defer { visitor.moveUp() }
+        guard isPresent else { return }
+        switch data {
+        case .node(let kind,let layout):
+            let shouldVisit = visitor.shouldVisit(kind)
+            var visitChildren = true
+            if shouldVisit {
+                // Visit this node realizes a syntax node.
+                visitor.visitPre()
+                visitChildren = visitor.visit() == .visitChildren
+            }
+            if visitChildren {
+                for (offset, element) in layout.enumerated() {
+                    guard let element = element else { continue }
+                    // Teach the visitor to navigate to this child.
+                    visitor.addChildIdx(offset)
+                    element.accept(visitor)
+                }
+            }
+            if shouldVisit {
+                visitor.visitPost()
+            }
+        case .token(let kind, _, _):
+            if visitor.shouldVisit(kind) {
+                visitor.visitPre()
+                _ = visitor.visit()
+                visitor.visitPost()
+            }
+        }
+    }
 }
 
 extension RawSyntax: TextOutputStreamable {
@@ -331,172 +408,5 @@ extension RawSyntax {
   /// The length of this node including all of its trivia
   var totalLength: SourceLength {
     return leadingTriviaLength + contentLength + trailingTriviaLength
-  }
-}
-
-// This is needed purely to have a self assignment initializer for
-// RawSyntax.init(from:Decoder) so we can reuse omitted nodes, instead of
-// copying them.
-private protocol _RawSyntaxFactory {}
-extension _RawSyntaxFactory {
-  init(_instance: Self) {
-    self = _instance
-  }
-}
-
-extension RawSyntax: Codable, _RawSyntaxFactory {
-  /// Creates a RawSyntax from the provided Foundation Decoder.
-  convenience init(from decoder: Decoder) throws {
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    let id = try container.decodeIfPresent(SyntaxNodeId.self, forKey: .id)
-    let omitted = try container.decodeIfPresent(Bool.self, forKey: .omitted) ?? false
-
-    if omitted {
-      guard let id = id else {
-        throw IncrementalDecodingError.omittedNodeHasNoId
-      }
-      guard let lookupFunc = decoder.userInfo[.omittedNodeLookupFunction] as?
-                               (SyntaxNodeId) -> RawSyntax? else {
-        throw IncrementalDecodingError.noLookupFunctionPassed
-      }
-      guard let lookupNode = lookupFunc(id) else {
-        throw IncrementalDecodingError.nodeLookupFailed(id)
-      }
-      self.init(_instance: lookupNode)
-      return
-    }
-
-    let presence = try container.decode(SourcePresence.self, forKey: .presence)
-    if let kind = try container.decodeIfPresent(SyntaxKind.self, forKey: .kind) {
-      let layout = try container.decode([RawSyntax?].self, forKey: .layout)
-      self.init(kind: kind, layout: layout, presence: presence, id: id)
-    } else {
-      let kind = try container.decode(TokenKind.self, forKey: .tokenKind)
-      let leadingTrivia = try container.decode(Trivia.self, forKey: .leadingTrivia)
-      let trailingTrivia = try container.decode(Trivia.self, forKey: .trailingTrivia)
-      self.init(kind: kind, leadingTrivia: leadingTrivia,
-                trailingTrivia: trailingTrivia, presence: presence, id: id)
-    }
-    if let callback = decoder.userInfo[.rawSyntaxDecodedCallback] as?
-                        (RawSyntax) -> Void {
-      callback(self)
-    }
-  }
-
-  /// Encodes the RawSyntax to the provided Foundation Encoder.
-  func encode(to encoder: Encoder) throws {
-    var container = encoder.container(keyedBy: CodingKeys.self)
-    switch self.data {
-    case let .node(kind, layout):
-      try container.encode(id, forKey: .id)
-      try container.encode(kind, forKey: .kind)
-      try container.encode(layout, forKey: .layout)
-    case let .token(kind, leadingTrivia, trailingTrivia):
-      try container.encode(id, forKey: .id)
-      try container.encode(kind, forKey: .tokenKind)
-      try container.encode(leadingTrivia, forKey: .leadingTrivia)
-      try container.encode(trailingTrivia, forKey: .trailingTrivia)
-    }
-    try container.encode(presence, forKey: .presence)
-  }
-}
-
-extension RawSyntax: ByteTreeObjectDecodable {
-  enum SyntaxType: UInt8, ByteTreeScalarDecodable {
-    case token = 0
-    case layout = 1
-    case omitted = 2
-
-    static func read(from pointer: UnsafeRawPointer, size: Int,
-                     userInfo: UnsafePointer<[ByteTreeUserInfoKey: Any]>
-    ) -> SyntaxType {
-      let rawValue = UInt8.read(from: pointer, size: size, userInfo: userInfo)
-      guard let type = SyntaxType(rawValue: rawValue) else {
-        fatalError("Unknown RawSyntax node type \(rawValue)")
-      }
-      return type
-    }
-  }
-
-  static func read(from reader: UnsafeMutablePointer<ByteTreeObjectReader>, 
-                   numFields: Int, 
-                   userInfo: UnsafePointer<[ByteTreeUserInfoKey: Any]>
-  ) throws -> RawSyntax {
-    let syntaxNode: RawSyntax
-    let type = try reader.pointee.readField(SyntaxType.self, index: 0)
-    let id = try reader.pointee.readField(SyntaxNodeId.self, index: 1)
-    switch type {
-    case .token:
-      let presence = try reader.pointee.readField(SourcePresence.self, index: 2)
-      let kind = try reader.pointee.readField(TokenKind.self, index: 3)
-      let leadingTrivia = try reader.pointee.readField(Trivia.self, index: 4)
-      let trailingTrivia = try reader.pointee.readField(Trivia.self, index: 5)
-      syntaxNode = RawSyntax(kind: kind, leadingTrivia: leadingTrivia,
-                             trailingTrivia: trailingTrivia,
-                             presence: presence, id: id)
-    case .layout:
-      let presence = try reader.pointee.readField(SourcePresence.self, index: 2)
-      let kind = try reader.pointee.readField(SyntaxKind.self, index: 3)
-      let layout = try reader.pointee.readField([RawSyntax?].self, index: 4)
-      syntaxNode = RawSyntax(kind: kind, layout: layout, presence: presence,
-                             id: id)
-    case .omitted:
-      guard let lookupFunc = userInfo.pointee[.omittedNodeLookupFunction] as?
-        (SyntaxNodeId) -> RawSyntax? else {
-          throw IncrementalDecodingError.noLookupFunctionPassed
-      }
-      guard let lookupNode = lookupFunc(id) else {
-        throw IncrementalDecodingError.nodeLookupFailed(id)
-      }
-      syntaxNode = lookupNode
-    }
-    if let callback = userInfo.pointee[.rawSyntaxDecodedCallback] as?
-      (RawSyntax) -> Void {
-      callback(syntaxNode)
-    }
-    return syntaxNode
-  }
-}
-
-extension SyntaxNodeId: ByteTreeScalarDecodable {
-  static func read(from pointer: UnsafeRawPointer, size: Int,
-                   userInfo: UnsafePointer<[ByteTreeUserInfoKey: Any]>
-  ) -> SyntaxNodeId {
-    let rawValue = UInt32.read(from: pointer, size: size, userInfo: userInfo)
-    return SyntaxNodeId(rawValue: UInt(rawValue))
-  }
-}
-
-extension RawSyntax {
-  func accept(_ visitor: RawSyntaxVisitor) {
-    defer { visitor.moveUp() }
-    guard isPresent else { return }
-    switch data {
-    case .node(let kind,let layout):
-      let shouldVisit = visitor.shouldVisit(kind)
-      var visitChildren = true
-      if shouldVisit {
-        // Visit this node realizes a syntax node.
-        visitor.visitPre()
-        visitChildren = visitor.visit() == .visitChildren
-      }
-      if visitChildren {
-        for (offset, element) in layout.enumerated() {
-          guard let element = element else { continue }
-          // Teach the visitor to navigate to this child.
-          visitor.addChildIdx(offset)
-          element.accept(visitor)
-        }
-      }
-      if shouldVisit {
-        visitor.visitPost()
-      }
-    case .token(let kind, _, _):
-      if visitor.shouldVisit(kind) {
-        visitor.visitPre()
-        _ = visitor.visit()
-        visitor.visitPost()
-      }
-    }
   }
 }

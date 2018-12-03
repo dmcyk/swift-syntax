@@ -88,26 +88,26 @@ private func runCore(_ executable: URL, _ arguments: [String] = [])
 ///   - arguments: A list of strings to pass to the process as arguments.
 /// - Returns: A ProcessResult containing stdout, stderr, and the exit code.
 private func run(_ executable: URL, arguments: [String] = []) -> ProcessResult {
-  #if _runtime(_ObjC)
+#if _runtime(_ObjC)
   // Use an autoreleasepool to prevent memory- and file-descriptor leaks.
   return autoreleasepool { () -> ProcessResult in
     runCore(executable, arguments)
   }
-  #else
+#else
   return runCore(executable, arguments)
-  #endif
+#endif
 }
 
 enum InvocationError: Error, CustomStringConvertible {
   case couldNotFindSwiftc
-  case couldNotFindSDK(message: String)
+  case couldNotFindSDK
 
   var description: String {
     switch self {
     case .couldNotFindSwiftc:
       return "could not locate swift compiler binary"
-    case .couldNotFindSDK(let message):
-      return "could not locate macOS SDK: \(message)"
+    case .couldNotFindSDK:
+      return "could not locate macOS SDK"
     }
   }
 }
@@ -142,25 +142,17 @@ struct SwiftcRunner {
     return lookupExecutablePath(filename: "swiftc")
   }
 
-  #if os(macOS)
+#if os(macOS)
   /// The location of the macOS SDK, or `nil` if it could not be found.
-  private static func getMacOSSDK() throws -> String {
-    guard let xcrunPath = lookupExecutablePath(filename: "xcrun") else {
-      throw InvocationError.couldNotFindSDK(message: "Could not find xcrun")
-    }
-    let result = run(xcrunPath, arguments: ["--show-sdk-path"])
-    guard result.wasSuccessful else { 
-      throw InvocationError.couldNotFindSDK(message: "Executing xcrun " +
-        "--show-sdk-path finished with non-zero-exit code \(result.exitCode)")
-    }
+  private static let macOSSDK: String? = {
+    let url = URL(fileURLWithPath: "/usr/bin/env")
+    let result = run(url, arguments: ["xcrun", "--show-sdk-path"])
+    guard result.wasSuccessful else { return nil }
     let toolPath = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-    if toolPath.isEmpty {
-      throw InvocationError.couldNotFindSDK(message: "Tool path is empty " +
-        "(running \(xcrunPath))")
-    }
+    if toolPath.isEmpty { return nil }
     return toolPath
-  }
-  #endif
+  }()
+#endif
 
   /// Internal static cache of the Swiftc path.
   private static let _swiftcURL: URL? = SwiftcRunner.locateSwiftc()
@@ -171,22 +163,15 @@ struct SwiftcRunner {
   /// The source file being parsed.
   private let sourceFile: URL
 
-  /// - Parameter sourceFile: The URL to the source file you're trying
-  ///                         to parse.
-
   /// Creates a SwiftcRunner that will parse and emit the syntax
   /// tree for a provided source file.
-  /// - Parameters:
-  ///   - sourceFile: The URL to the source file you're trying to parse
-  ///   - swiftcURL: The path to a `swiftc` executable that shall be used to
-  ///                parse the file. If `nil`, `swiftc` will be inferred from
-  ///                `PATH`.
-  /// - Throws: When the swiftc executable cannot be found
-  init(sourceFile: URL, swiftcURL: URL? = nil) throws {
-    guard let swiftcURL = swiftcURL ?? SwiftcRunner._swiftcURL else {
+  /// - Parameter sourceFile: The URL to the source file you're trying
+  ///                         to parse.
+  init(sourceFile: URL) throws {
+    guard let url = SwiftcRunner._swiftcURL else {
       throw InvocationError.couldNotFindSwiftc
     }
-    self.swiftcURL = swiftcURL
+    self.swiftcURL = url
     self.sourceFile = sourceFile
   }
 
@@ -194,10 +179,13 @@ struct SwiftcRunner {
   func invoke() throws -> ProcessResult {
     var arguments = ["-frontend", "-emit-syntax"]
     arguments.append(sourceFile.path)
-    #if os(macOS)
+#if os(macOS)
+    guard let sdk = SwiftcRunner.macOSSDK else {
+      throw InvocationError.couldNotFindSDK
+    }
     arguments.append("-sdk")
-    arguments.append(try SwiftcRunner.getMacOSSDK())
-    #endif
+    arguments.append(sdk)
+#endif
     return run(swiftcURL, arguments: arguments)
   }
 }
