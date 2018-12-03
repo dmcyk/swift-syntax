@@ -20,6 +20,7 @@ import Darwin
 import Glibc
 #endif
 
+#if os(macOS) || os(Linux)
 /// The result of process execution, containing the exit status code,
 /// stdout, and stderr
 struct ProcessResult {
@@ -189,3 +190,5 @@ struct SwiftcRunner {
     return run(swiftcURL, arguments: arguments)
   }
 }
+
+#endif

@@ -89,6 +89,11 @@ public final class SyntaxTreeDeserializer {
 /// Namespace for functions to retrieve a syntax tree from the swift compiler
 /// and deserializing it.
 public enum SyntaxTreeParser {
+
+}
+#if os(macOS) || os(Linux)
+
+extension SyntaxTreeParser {
   /// Parses the Swift file at the provided URL into a full-fidelity Syntax tree
   /// - Parameter url: The URL you wish to parse.
   /// - Returns: A top-level Syntax node representing the contents of the tree,
@@ -104,3 +109,14 @@ public enum SyntaxTreeParser {
     return try deserializer.deserialize(syntaxTreeData)
   }
 }
+#endif
+
+extension SyntaxTreeParser {
+
+  public static func parse(data: Data) throws -> SourceFileSyntax {
+    let deserialzier = SyntaxTreeDeserializer()
+    return try deserialzier.deserialize(data)
+  }
+}
+
+
